@@ -113,8 +113,26 @@ int main(int argc, const char **argv) {
           busy_streams.push_back(k->get_cuda_stream_id());
         }
       }
-    }
-    else if (kernels_info.empty())
+    } else if (commandlist[i].m_type == command_type::ncclAllReduce) {
+      unsigned int latency = 
+        m_gpgpu_sim->get_config().get_nccl_allreduce_latency(); 
+      std::cout << "ncclAllReduce was run! Latency: " << latency << " cycles." 
+        << std::endl; 
+      m_gpgpu_sim->gpu_tot_sim_cycle += latency; 
+      i++;
+    } else if (commandlist[i].m_type == command_type::ncclCommInitAll) {
+      std::cout << "ncclCommInitAll was run!" << std::endl; 
+      i++; 
+    } else if (commandlist[i].m_type == command_type::ncclCommDestroy) {
+      std::cout << "ncclCommDestroy was run!" << std::endl; 
+      i++; 
+    } else if (commandlist[i].m_type == command_type::ncclGroupStart) {
+      std::cout << "ncclGroupStart was run!" << std::endl; 
+      i++; 
+    } else if (commandlist[i].m_type == command_type::ncclGroupEnd) {
+      std::cout << "ncclGroupEnd was run!" << std::endl; 
+      i++; 
+    } else if (kernels_info.empty())
     	assert(0 && "Undefined Command");
 
     bool active = false;

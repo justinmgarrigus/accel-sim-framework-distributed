@@ -249,7 +249,33 @@ std::vector<trace_command> trace_parser::parse_commandlist_file() {
       filepath = directory + "/" + line;
       command.command_string = filepath;
       commandlist.push_back(command);
+    } else if (line.substr(0, 15) == "ncclCommInitAll") {
+      trace_command command; 
+      command.command_string = line; 
+      command.m_type = command_type::ncclCommInitAll; 
+      commandlist.push_back(command); 
+    } else if (line.substr(0, 15) == "ncclCommDestroy") {
+      trace_command command; 
+      command.command_string = line; 
+      command.m_type = command_type::ncclCommDestroy; 
+      commandlist.push_back(command); 
+    } else if (line.substr(0, 14) == "ncclGroupStart") {
+      trace_command command; 
+      command.command_string = line; 
+      command.m_type = command_type::ncclGroupStart; 
+      commandlist.push_back(command); 
+    } else if (line.substr(0, 13) == "ncclGroupEnd") {
+      trace_command command; 
+      command.command_string = line; 
+      command.m_type = command_type::ncclGroupEnd; 
+      commandlist.push_back(command); 
+    } else if (line.substr(0, 13) == "ncclAllReduce") {
+      trace_command command; 
+      command.command_string = line; 
+      command.m_type = command_type::ncclAllReduce; 
+      commandlist.push_back(command); 
     }
+
     // ignore gpu_to_cpu_memory_cpy
   }
 

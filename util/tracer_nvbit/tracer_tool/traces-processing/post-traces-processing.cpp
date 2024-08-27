@@ -69,7 +69,9 @@ int main(int argc, char **argv) {
       filepath = directory + "/" + line;
       group_per_block(filepath.c_str());
       ofs << line + "g" << endl;
-    } else {
+    } else if (line.substr(0, 4) == "nccl") {
+      ofs << line << endl; 
+    }else {
       cout << "Undefined command: " << line << endl;
       return 0;
     }

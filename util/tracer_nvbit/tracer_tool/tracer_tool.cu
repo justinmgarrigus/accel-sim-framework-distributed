@@ -30,6 +30,11 @@
 
 #define TRACER_VERSION "3"
 
+/* New NCCL material */ 
+#include <dlfcn.h>
+#include "nccl.h" 
+
+
 /* Channel used to communicate from GPU to CPU receiving thread */
 #define CHANNEL_SIZE (1l << 20)
 static __managed__ ChannelDev channel_dev;
@@ -59,6 +64,8 @@ bool active_region = true;
 int terminate_after_limit_number_of_kernels_reached = 0;
 int user_defined_folders = 0;
 
+int gpu_id = -1;
+
 /* opcode to id map and reverse map  */
 std::map<std::string, int> opcode_to_id_map;
 std::map<int, std::string> id_to_opcode_map;
@@ -76,6 +83,7 @@ uint64_t dynamic_kernel_limit_end = 0; // 0 means no limit
 enum address_format { list_all = 0, base_stride = 1, base_delta = 2 };
 
 void nvbit_at_init() {
+  printf("- nvbit_at_init()\n"); 
   setenv("CUDA_MANAGED_FORCE_DEVICE_ALLOC", "1", 1);
   GET_VAR_INT(
       instr_begin_interval, "INSTR_BEGIN", 0,
@@ -115,7 +123,7 @@ std::unordered_set<CUfunction> already_instrumented;
 /* instrument each memory instruction adding a call to the above instrumentation
  * function */
 void instrument_function_if_needed(CUcontext ctx, CUfunction func) {
-
+  printf("- instrument_function_if_needed()\n"); 
   std::vector<CUfunction> related_functions =
       nvbit_get_related_functions(ctx, func);
 
@@ -241,6 +249,7 @@ void instrument_function_if_needed(CUcontext ctx, CUfunction func) {
 }
 
 __global__ void flush_channel() {
+  printf("- flush_channel()\n"); 
   /* push memory access with negative cta id to communicate the kernel is
    * completed */
   inst_trace_t ma;
@@ -260,9 +269,10 @@ static bool first_call = true;
 unsigned old_total_insts = 0;
 unsigned old_total_reported_insts = 0;
 
+int counter = 0; 
 void nvbit_at_cuda_event(CUcontext ctx, int is_exit, nvbit_api_cuda_t cbid,
                          const char *name, void *params, CUresult *pStatus) {
-
+  printf("- nvbit_at_cuda_event(%s, %d)\n", name, counter++); 
   if (skip_flag)
     return;
 
@@ -363,9 +373,12 @@ void nvbit_at_cuda_event(CUcontext ctx, int is_exit, nvbit_api_cuda_t cbid,
 
       char buffer[1024];
       sprintf(buffer, std::string(traces_location+"/kernel-%d.trace").c_str(), kernelid);
+      
+      CUDA_SAFECALL(cuCtxGetDevice(&gpu_id));
+      
 
       if (!stop_report) {
-        resultsFile = fopen(buffer, "w");
+        resultsFile = fopen(buffer, "a");
 
         printf("Writing results to %s\n", buffer);
 
@@ -563,6 +576,7 @@ void base_delta_compress(const uint64_t *addrs, const std::bitset<32> &mask,
 }
 
 void *recv_thread_fun(void *) {
+  printf("- recv_thread_fun()\n");
   char *recv_buffer = (char *)malloc(CHANNEL_SIZE);
 
   while (recv_thread_started) {
@@ -570,6 +584,8 @@ void *recv_thread_fun(void *) {
     if (recv_thread_receiving &&
         (num_recv_bytes = channel_host.recv(recv_buffer, CHANNEL_SIZE)) > 0) {
       uint32_t num_processed_bytes = 0;
+     
+      
       while (num_processed_bytes < num_recv_bytes) {
         inst_trace_t *ma = (inst_trace_t *)&recv_buffer[num_processed_bytes];
 
@@ -579,6 +595,20 @@ void *recv_thread_fun(void *) {
           recv_thread_receiving = false;
           break;
         }
+        /*fprintf(resultsFile, "GPU%d ", gpu_id);
+
+        if (strcmp(id_to_opcode_map[ma->opcode_id].c_str(), "cudaMemcpyPeer") == 0 ||
+            strcmp(id_to_opcode_map[ma->opcode_id].c_str(), "cudaMemcpyPeerAsync") == 0 ||
+            strcmp(id_to_opcode_map[ma->opcode_id].c_str(), "ncclAllReduce") == 0 ||
+            strcmp(id_to_opcode_map[ma->opcode_id].c_str(), "ncclBroadcast") == 0 ||
+            strcmp(id_to_opcode_map[ma->opcode_id].c_str(), "ncclReduce") == 0 ||
+            strcmp(id_to_opcode_map[ma->opcode_id].c_str(), "ncclAllGather") == 0 ||
+            strcmp(id_to_opcode_map[ma->opcode_id].c_str(), "ncclReduceScatter") == 0) {
+          fprintf(resultsFile, "1 ");
+        } else {
+          fprintf(resultsFile, "0 ");
+        }
+        */ 
 
         fprintf(resultsFile, "%d ", ma->cta_id_x);
         fprintf(resultsFile, "%d ", ma->cta_id_y);
@@ -669,14 +699,95 @@ void *recv_thread_fun(void *) {
 }
 
 void nvbit_at_ctx_init(CUcontext ctx) {
+  printf("- nvbit_at_ctx_init()\n"); 
   recv_thread_started = true;
   channel_host.init(0, CHANNEL_SIZE, &channel_dev, NULL);
   pthread_create(&recv_thread, NULL, recv_thread_fun, NULL);
 }
 
 void nvbit_at_ctx_term(CUcontext ctx) {
+  printf("- nvbit_at_ctx_term()\n"); 
   if (recv_thread_started) {
     recv_thread_started = false;
     pthread_join(recv_thread, NULL);
   }
+}
+
+// === NCCL Functions === // 
+// 
+// For each of the functions here, we have the start of the function containing
+// the new code (e.g., print statements and timing information) and the bottom 
+// of the function containing a way to run the original NCCL function. This is 
+// so the trace collector doesn't impact the execution of the original script. 
+
+/* 
+ * Writes the string to the kernelslist file, which is also where the kernel
+ * invocations and the MemcpyHtoD is. A newline is not inserted. Also, this 
+ * opens and closes the file each time for ease of use, which can be slow.
+ */
+void write_to_kernelslist_file(char* str) {
+    kernelsFile = fopen(kernelslist_location.c_str(), "a");
+    fprintf(kernelsFile, str); 
+    fclose(kernelsFile);
+} 
+
+ncclResult_t ncclAllReduce(
+    const void* sendbuff, 
+    void* recvbuff, 
+    size_t count, 
+    ncclDataType_t datatype,
+    ncclRedOp_t op, 
+    ncclComm_t comm,
+    cudaStream_t stream
+) {
+    printf("- ncclAllReduce()\n");
+    write_to_kernelslist_file("ncclAllReduce\n"); 
+
+    ncclResult_t (*real_ncclAllReduce)(const void*, void*, size_t, 
+        ncclDataType_t, ncclRedOp_t, ncclComm_t, cudaStream_t) = 
+        (ncclResult_t(*)(const void*, void*, size_t, ncclDataType_t, 
+        ncclRedOp_t, ncclComm_t, cudaStream_t))
+        dlsym(RTLD_NEXT, "ncclAllReduce"); 
+    return real_ncclAllReduce(sendbuff, recvbuff, count, datatype, op, comm, 
+        stream);
+}
+
+ncclResult_t ncclCommInitAll(ncclComm_t* comms, int ndev, const int* devlist) {
+    printf("- ncclCommInitAll()\n");
+    write_to_kernelslist_file("ncclCommInitAll\n"); 
+
+    ncclResult_t (*real_ncclCommInitAll)(ncclComm_t*, int, const int*) = 
+        (ncclResult_t(*)(ncclComm_t*, int, const int*))
+        dlsym(RTLD_NEXT, "ncclCommInitAll"); 
+    return real_ncclCommInitAll(comms, ndev, devlist); 
+}
+
+ncclResult_t ncclCommDestroy(ncclComm_t comm) {
+    printf("- ncclCommDestroy()\n");
+    write_to_kernelslist_file("ncclCommDestroy\n"); 
+    
+    ncclResult_t (*real_ncclCommDestroy)(ncclComm_t) = 
+        (ncclResult_t(*)(ncclComm_t))
+        dlsym(RTLD_NEXT, "ncclCommDestroy"); 
+    return real_ncclCommDestroy(comm); 
+}
+
+ncclResult_t ncclGroupStart() {
+    printf("- ncclGroupStart()\n"); 
+    write_to_kernelslist_file("ncclGroupStart\n"); 
+    
+    ncclResult_t (*real_ncclGroupStart)() = 
+        (ncclResult_t(*)())
+        dlsym(RTLD_NEXT, "ncclGroupStart");
+    return real_ncclGroupStart();
+}
+
+ncclResult_t ncclGroupEnd() {
+    printf("- ncclGroupEnd()\n");
+    write_to_kernelslist_file("ncclGroupEnd\n"); 
+    
+    ncclResult_t (*real_ncclGroupEnd)() = 
+        (ncclResult_t(*)())
+        dlsym(RTLD_NEXT, "ncclGroupEnd"); 
+    return real_ncclGroupEnd(); 
 }
