@@ -1,3 +1,6 @@
 bin/
 build/
-gpgpu-sim/
+
+## Saves us time from making a new fork under a new account and maintaining
+## this separate project. 
+# gpgpu-sim/
