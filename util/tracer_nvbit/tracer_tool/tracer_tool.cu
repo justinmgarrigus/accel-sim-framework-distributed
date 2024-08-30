@@ -372,16 +372,21 @@ void nvbit_at_cuda_event(CUcontext ctx, int is_exit, nvbit_api_cuda_t cbid,
       }
 
       char buffer[1024];
-      sprintf(buffer, std::string(traces_location+"/kernel-%d.trace").c_str(), kernelid);
-      
       CUDA_SAFECALL(cuCtxGetDevice(&gpu_id));
+      sprintf(buffer, "kernel-%d_%d.trace", kernelid, gpu_id);
+      
+      
       
 
       if (!stop_report) {
-        resultsFile = fopen(buffer, "a");
+        std::string file_path = traces_location + "/" + buffer;
+        
+        resultsFile = fopen(file_path.c_str(), "a");
 
         printf("Writing results to %s\n", buffer);
-
+        
+        /*fprintf(resultsFile, "-gpu id = %d\n", gpu_id);*/
+        
         fprintf(resultsFile, "-kernel name = %s\n",
                 nvbit_get_func_name(ctx, p->f, true));
         fprintf(resultsFile, "-kernel id = %d\n", kernelid);
@@ -411,7 +416,7 @@ void nvbit_at_cuda_event(CUcontext ctx, int is_exit, nvbit_api_cuda_t cbid,
 
       kernelsFile = fopen(kernelslist_location.c_str(), "a");
       // This will be a relative path to the traces file
-      sprintf(buffer,"kernel-%d.trace", kernelid);
+      sprintf(buffer, "kernel-%d_%d.trace", kernelid, gpu_id);
       if (!stop_report) {
         fprintf(kernelsFile, buffer);
         fprintf(kernelsFile, "\n");
