@@ -1,4 +1,3 @@
-nvbit_release/
 silicon_checkpoint_tool/checkpoint/checkpoint.o
 silicon_checkpoint_tool/checkpoint/checkpoint.so
 tracer_tool/tracer_tool.o

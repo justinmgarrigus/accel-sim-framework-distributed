@@ -12,6 +12,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string>
+#include <string.h> 
 #include <sys/stat.h>
 #include <unistd.h>
 #include <unordered_set>
@@ -33,7 +34,7 @@
 /* New NCCL material */ 
 #include <dlfcn.h>
 #include "nccl.h" 
-
+int gpu_trace_id = -1;
 
 /* Channel used to communicate from GPU to CPU receiving thread */
 #define CHANNEL_SIZE (1l << 20)
@@ -56,15 +57,13 @@ int verbose = 0;
 int enable_compress = 1;
 int print_core_id = 0;
 int exclude_pred_off = 1;
-int active_from_start = 1;
+int active_from_start = 1; 
 /* used to select region of interest when active from start is 0 */
 bool active_region = true;
 
 /* Should we terminate the program once we are done tracing? */
 int terminate_after_limit_number_of_kernels_reached = 0;
 int user_defined_folders = 0;
-
-int gpu_id = -1;
 
 /* opcode to id map and reverse map  */
 std::map<std::string, int> opcode_to_id_map;
@@ -109,6 +108,8 @@ void nvbit_at_init() {
               "Stop the process once the current kernel > DYNAMIC_KERNEL_LIMIT_END");
   GET_VAR_INT(user_defined_folders, "USER_DEFINED_FOLDERS", 0, "Uses the user defined "
               "folder TRACES_FOLDER path environment");
+  GET_VAR_INT(gpu_trace_id, "GPU_TRACE_ID", -1, "The ID of the GPU to collect "
+    "traces for, or -1 if all GPU traces should be attempted."); 
   std::string pad(100, '-');
   printf("%s\n", pad.c_str());
 
@@ -261,6 +262,7 @@ __global__ void flush_channel() {
 }
 
 static FILE *resultsFile = NULL;
+static char kernel_fname[64]; 
 static FILE *kernelsFile = NULL;
 static FILE *statsFile = NULL;
 static int kernelid = 1;
@@ -272,7 +274,23 @@ unsigned old_total_reported_insts = 0;
 int counter = 0; 
 void nvbit_at_cuda_event(CUcontext ctx, int is_exit, nvbit_api_cuda_t cbid,
                          const char *name, void *params, CUresult *pStatus) {
-  printf("- nvbit_at_cuda_event(%s, %d)\n", name, counter++); 
+  
+  int local_counter = counter;
+  if (gpu_trace_id != -1) { 
+    if (cbid == API_CUDA_cuCtxGetDevice)
+      // We'll be calling this a lot if we're trying to only obtain traces for 
+      // a specific device. 
+      return;
+  
+    int gpu_id; 
+    CUDA_SAFECALL(cuCtxGetDevice(&gpu_id)); 
+    printf("- nvbit_at_cuda_event(%s, %d, %d [%d%s])\n", name, counter++, 
+      skip_flag, gpu_id, gpu_trace_id != gpu_id ? " (skipped)" : "");
+    
+    if (gpu_trace_id != gpu_id)
+      return; 
+  }
+
   if (skip_flag)
     return;
 
@@ -336,9 +354,35 @@ void nvbit_at_cuda_event(CUcontext ctx, int is_exit, nvbit_api_cuda_t cbid,
     }
 
   } else if (cbid == API_CUDA_cuLaunchKernel_ptsz ||
-             cbid == API_CUDA_cuLaunchKernel) {
-    cuLaunchKernel_params *p = (cuLaunchKernel_params *)params;
-
+             cbid == API_CUDA_cuLaunchKernel || 
+             strcmp(name, "cuLaunchKernelEx") == 0) { // cbid == API_CUDA_cuLaunchKernelEx) { // "API_CUDA_cuLaunchKernelEx" unrecognized.
+        
+    cuLaunchKernel_params *p;                                                   
+    int dynamically_allocated_params;                                           
+    if (cbid == API_CUDA_cuLaunchKernel_ptsz || 
+        cbid == API_CUDA_cuLaunchKernel)                                        
+    {                                                                           
+      p = (cuLaunchKernel_params *)params;                                      
+      dynamically_allocated_params = 0;                                         
+    }                                                                           
+    else { // cuLaunchKernelEx                                                  
+      printf("  - cuLaunchKernelEx found! [%d]", local_counter);                
+      cuLaunchKernelEx_params *exp = (cuLaunchKernelEx_params*)params;          
+      p = (cuLaunchKernel_params*)malloc(sizeof(cuLaunchKernel_params));        
+      dynamically_allocated_params = 1;                                         
+                                                                                
+      // Make "p" identical to "exp"                                            
+      p->f = exp->f; 
+      p->gridDimX = exp->config->gridDimX;                                      
+      p->gridDimY = exp->config->gridDimY;                                      
+      p->gridDimZ = exp->config->gridDimZ;                                      
+      p->blockDimX = exp->config->blockDimX;                                    
+      p->blockDimY = exp->config->blockDimY;                                    
+      p->blockDimZ = exp->config->blockDimZ;                                    
+      p->sharedMemBytes = exp->config->sharedMemBytes;                          
+      p->hStream = exp->config->hStream;                                        
+    }
+    
     if (!is_exit) {
 
       if (active_from_start && dynamic_kernel_limit_start && kernelid == dynamic_kernel_limit_start)
@@ -371,22 +415,22 @@ void nvbit_at_cuda_event(CUcontext ctx, int is_exit, nvbit_api_cuda_t cbid,
         stop_report = true;
       }
 
-      char buffer[1024];
-      CUDA_SAFECALL(cuCtxGetDevice(&gpu_id));
-      sprintf(buffer, "kernel-%d_%d.trace", kernelid, gpu_id);
-      
-      
-      
+      if (gpu_trace_id != -1) 
+        sprintf(kernel_fname, "kernel-%d_%d.trace", kernelid, gpu_trace_id); 
+      else 
+        sprintf(kernel_fname, "kernel-%d.trace", kernelid); 
 
       if (!stop_report) {
-        std::string file_path = traces_location + "/" + buffer;
+        std::string file_path = traces_location + "/" + kernel_fname;
         
+        printf("[%d] Opening resultsFile \"%s\"\n", local_counter, 
+            file_path.c_str()); 
         resultsFile = fopen(file_path.c_str(), "a");
 
-        printf("Writing results to %s\n", buffer);
+        printf("[%d] Writing results to \"%s\"\n", local_counter, 
+            kernel_fname);
         
-        /*fprintf(resultsFile, "-gpu id = %d\n", gpu_id);*/
-        
+        printf("Writing line to resultsFile \"%s\"\n", kernel_fname); 
         fprintf(resultsFile, "-kernel name = %s\n",
                 nvbit_get_func_name(ctx, p->f, true));
         fprintf(resultsFile, "-kernel id = %d\n", kernelid);
@@ -406,6 +450,7 @@ void nvbit_at_cuda_event(CUcontext ctx, int is_exit, nvbit_api_cuda_t cbid,
         fprintf(resultsFile, "-nvbit version = %s\n", NVBIT_VERSION);
         fprintf(resultsFile, "-accelsim tracer version = %s\n", TRACER_VERSION);
         fprintf(resultsFile, "\n");
+        fflush(resultsFile); 
 
         fprintf(resultsFile,
                 "#traces format = threadblock_x threadblock_y threadblock_z "
@@ -416,9 +461,8 @@ void nvbit_at_cuda_event(CUcontext ctx, int is_exit, nvbit_api_cuda_t cbid,
 
       kernelsFile = fopen(kernelslist_location.c_str(), "a");
       // This will be a relative path to the traces file
-      sprintf(buffer, "kernel-%d_%d.trace", kernelid, gpu_id);
       if (!stop_report) {
-        fprintf(kernelsFile, buffer);
+        fprintf(kernelsFile, kernel_fname);
         fprintf(kernelsFile, "\n");
       }
       fclose(kernelsFile);
@@ -427,7 +471,7 @@ void nvbit_at_cuda_event(CUcontext ctx, int is_exit, nvbit_api_cuda_t cbid,
       unsigned blocks = p->gridDimX * p->gridDimY * p->gridDimZ;
       unsigned threads = p->blockDimX * p->blockDimY * p->blockDimZ;
 
-      fprintf(statsFile, "%s, %s, %d, %d, %d, %d, %d, %d, %d, %d, ", buffer,
+      fprintf(statsFile, "%s, %s, %d, %d, %d, %d, %d, %d, %d, %d, ", kernel_fname,
               nvbit_get_func_name(ctx, p->f, true), p->gridDimX, p->gridDimY,
               p->gridDimZ, blocks, p->blockDimX, p->blockDimY, p->blockDimZ,
               threads);
@@ -481,6 +525,10 @@ void nvbit_at_cuda_event(CUcontext ctx, int is_exit, nvbit_api_cuda_t cbid,
       if (active_from_start && dynamic_kernel_limit_end && kernelid > dynamic_kernel_limit_end)
         active_region = false;
     }
+
+    if (dynamically_allocated_params) 
+      free(p);
+
   } else if (cbid == API_CUDA_cuProfilerStart && is_exit) {
       if (!active_from_start) {
         active_region = true;
@@ -614,7 +662,8 @@ void *recv_thread_fun(void *) {
           fprintf(resultsFile, "0 ");
         }
         */ 
-
+        
+        printf("Writing line to kernel_fname \"%s\"\n", kernel_fname); 
         fprintf(resultsFile, "%d ", ma->cta_id_x);
         fprintf(resultsFile, "%d ", ma->cta_id_y);
         fprintf(resultsFile, "%d ", ma->cta_id_z);
@@ -694,6 +743,7 @@ void *recv_thread_fun(void *) {
         }
 
         fprintf(resultsFile, "\n");
+        fflush(resultsFile); 
 
         num_processed_bytes += sizeof(inst_trace_t);
       }
