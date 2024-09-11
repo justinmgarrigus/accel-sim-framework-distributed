@@ -34,7 +34,6 @@
 #include <dlfcn.h>
 #include "nccl.h" 
 
-
 /* Channel used to communicate from GPU to CPU receiving thread */
 #define CHANNEL_SIZE (1l << 20)
 static __managed__ ChannelDev channel_dev;
@@ -57,6 +56,7 @@ int enable_compress = 1;
 int print_core_id = 0;
 int exclude_pred_off = 1;
 int active_from_start = 1;
+int lineinfo = 0;
 /* used to select region of interest when active from start is 0 */
 bool active_region = true;
 
@@ -92,6 +92,9 @@ void nvbit_at_init() {
               "End of the instruction interval where to apply instrumentation");
   GET_VAR_INT(exclude_pred_off, "EXCLUDE_PRED_OFF", 1,
               "Exclude predicated off instruction from count");
+  GET_VAR_INT(lineinfo, "TRACE_LINEINFO", 0,
+              "Include source code line info at the start of each traced line. "
+              "The target binary must be compiled with -lineinfo or --generate-line-info");
   GET_VAR_INT(dynamic_kernel_limit_end, "DYNAMIC_KERNEL_LIMIT_END", 0,
               "Limit of the number kernel to be printed, 0 means no limit");
   GET_VAR_INT(dynamic_kernel_limit_start, "DYNAMIC_KERNEL_LIMIT_START", 0,
@@ -146,6 +149,8 @@ void instrument_function_if_needed(CUcontext ctx, CUfunction func) {
     uint32_t cnt = 0;
     /* iterate on all the static instructions in the function */
     for (auto instr : instrs) {
+      uint32_t line_num = 0;
+
       if (cnt < instr_begin_interval || cnt >= instr_end_interval) {
         cnt++;
         continue;
@@ -153,6 +158,11 @@ void instrument_function_if_needed(CUcontext ctx, CUfunction func) {
 
       if (verbose) {
         instr->printDecoded();
+      }
+
+      if(lineinfo) {
+        char *file_name, *dir_name;
+        nvbit_get_line_info(ctx, func, instr->getOffset(), &file_name, &dir_name, &line_num);
       }
 
       if (opcode_to_id_map.find(instr->getOpcode()) == opcode_to_id_map.end()) {
@@ -163,86 +173,100 @@ void instrument_function_if_needed(CUcontext ctx, CUfunction func) {
 
       int opcode_id = opcode_to_id_map[instr->getOpcode()];
 
-      /* insert call to the instrumentation function with its
-       * arguments */
-      nvbit_insert_call(instr, "instrument_inst", IPOINT_BEFORE);
-
-      /* pass predicate value */
-      nvbit_add_call_arg_guard_pred_val(instr);
-
-      /* send opcode and pc */
-      nvbit_add_call_arg_const_val32(instr, opcode_id);
-      nvbit_add_call_arg_const_val32(instr, (int)instr->getOffset());
-
       /* check all operands. For now, we ignore constant, TEX, predicates and
        * unified registers. We only report vector regisers */
       int src_oprd[MAX_SRC];
       int srcNum = 0;
       int dst_oprd = -1;
       int mem_oper_idx = -1;
+      int num_mref = 0;
+      uint64_t imm_value = 0;
 
-      /* find dst reg and handle the special case if the oprd[0] is mem (e.g.
-       * store and RED)*/
-      if (instr->getNumOperands() > 0 &&
-          instr->getOperand(0)->type == InstrType::OperandType::REG)
-        dst_oprd = instr->getOperand(0)->u.reg.num;
-      else if (instr->getNumOperands() > 0 &&
-               instr->getOperand(0)->type == InstrType::OperandType::MREF) {
-        src_oprd[0] = instr->getOperand(0)->u.mref.ra_num;
-        mem_oper_idx = 0;
-        srcNum++;
-      }
-
-      // find src regs and mem
-      for (int i = 1; i < MAX_SRC; i++) {
-        if (i < instr->getNumOperands()) {
-          const InstrType::operand_t *op = instr->getOperand(i);
-          if (op->type == InstrType::OperandType::MREF) {
-            // mem is found
-            assert(srcNum < MAX_SRC);
-            src_oprd[srcNum] = instr->getOperand(i)->u.mref.ra_num;
-            srcNum++;
-            // TO DO: handle LDGSTS with two mem refs
-            assert(mem_oper_idx == -1); // ensure one memory operand per inst
-            mem_oper_idx++;
-          } else if (op->type == InstrType::OperandType::REG) {
-            // reg is found
+      for(int i = 0; i < instr->getNumOperands(); ++i){
+        const InstrType::operand_t *op = instr->getOperand(i);
+        if (op->type == InstrType::OperandType::MREF) {
+          assert(srcNum < MAX_SRC);
+          src_oprd[srcNum] = instr->getOperand(i)->u.mref.ra_num;
+          srcNum++;
+          mem_oper_idx++;
+          num_mref++;
+          // if(mem_oper_idx == 0){
+          //   mem_oper_idx = 1; // loop control
+          // }
+        }
+        else if (op->type == InstrType::OperandType::REG){
+          if (i == 0){
+            // find dst reg
+            dst_oprd = instr->getOperand(0)->u.reg.num;
+          }
+          else {
+            // find src regs
             assert(srcNum < MAX_SRC);
             src_oprd[srcNum] = instr->getOperand(i)->u.reg.num;
             srcNum++;
           }
-          // skip anything else (constant and predicates)
+        }
+        // Add immediate value for DEPBAR instruction
+        else if (op->type == InstrType::OperandType::IMM_UINT64) {
+          imm_value = instr->getOperand(i)->u.imm_uint64.value;
         }
       }
 
-      /* mem addresses info */
-      if (mem_oper_idx >= 0) {
-        nvbit_add_call_arg_const_val32(instr, 1);
-        nvbit_add_call_arg_mref_addr64(instr, 0);
-        nvbit_add_call_arg_const_val32(instr, (int)instr->getSize());
-      } else {
-        nvbit_add_call_arg_const_val32(instr, 0);
-        nvbit_add_call_arg_const_val64(instr, -1);
-        nvbit_add_call_arg_const_val32(instr, -1);
-      }
+      do{
+        /* insert call to the instrumentation function with its
+        * arguments */
+        nvbit_insert_call(instr, "instrument_inst", IPOINT_BEFORE);
 
-      /* reg info */
-      nvbit_add_call_arg_const_val32(instr, dst_oprd);
-      for (int i = 0; i < srcNum; i++) {
-        nvbit_add_call_arg_const_val32(instr, src_oprd[i]);
-      }
-      for (int i = srcNum; i < MAX_SRC; i++) {
-        nvbit_add_call_arg_const_val32(instr, -1);
-      }
-      nvbit_add_call_arg_const_val32(instr, srcNum);
+        /* pass predicate value */
+        nvbit_add_call_arg_guard_pred_val(instr);
 
-      /* add pointer to channel_dev and other counters*/
-      nvbit_add_call_arg_const_val64(instr, (uint64_t)&channel_dev);
-      nvbit_add_call_arg_const_val64(instr,
-                                     (uint64_t)&total_dynamic_instr_counter);
-      nvbit_add_call_arg_const_val64(instr,
-                                     (uint64_t)&reported_dynamic_instr_counter);
-      nvbit_add_call_arg_const_val64(instr, (uint64_t)&stop_report);
+        /* send opcode and pc */
+        nvbit_add_call_arg_const_val32(instr, opcode_id);
+        nvbit_add_call_arg_const_val32(instr, (int)instr->getOffset());
+
+        /* mem addresses info */
+        if (mem_oper_idx >= 0) {
+          nvbit_add_call_arg_const_val32(instr, 1);
+          assert(num_mref <= 2);
+          if (num_mref == 2) {  // LDGSTS
+            nvbit_add_call_arg_mref_addr64(instr, 1-mem_oper_idx);
+          }
+          else {
+            nvbit_add_call_arg_mref_addr64(instr, mem_oper_idx);
+          }
+          nvbit_add_call_arg_const_val32(instr, (int)instr->getSize());
+        } else {
+          nvbit_add_call_arg_const_val32(instr, 0);
+          nvbit_add_call_arg_const_val64(instr, -1);
+          nvbit_add_call_arg_const_val32(instr, -1);
+        }
+
+        /* reg info */
+        nvbit_add_call_arg_const_val32(instr, dst_oprd);
+        for (int i = 0; i < srcNum; i++) {
+          nvbit_add_call_arg_const_val32(instr, src_oprd[i]);
+        }
+        for (int i = srcNum; i < MAX_SRC; i++) {
+          nvbit_add_call_arg_const_val32(instr, -1);
+        }
+        nvbit_add_call_arg_const_val32(instr, srcNum);
+
+        /* immediate info */
+        nvbit_add_call_arg_const_val64(instr, imm_value);
+       
+        /* add pointer to channel_dev and other counters*/
+        nvbit_add_call_arg_const_val64(instr, (uint64_t)&channel_dev);
+        nvbit_add_call_arg_const_val64(instr,
+                                      (uint64_t)&total_dynamic_instr_counter);
+        nvbit_add_call_arg_const_val64(instr,
+                                      (uint64_t)&reported_dynamic_instr_counter);
+        nvbit_add_call_arg_const_val64(instr, (uint64_t)&stop_report);
+        /* Add Source code line number for current instr */
+        nvbit_add_call_arg_const_val32(instr, (int)line_num);
+
+        mem_oper_idx--;
+      } while (mem_oper_idx >= 0);
+
       cnt++;
     }
   }
@@ -261,6 +285,7 @@ __global__ void flush_channel() {
 }
 
 static FILE *resultsFile = NULL;
+static char resultsFileName[1024]; 
 static FILE *kernelsFile = NULL;
 static FILE *statsFile = NULL;
 static int kernelid = 1;
@@ -272,7 +297,22 @@ unsigned old_total_reported_insts = 0;
 int counter = 0; 
 void nvbit_at_cuda_event(CUcontext ctx, int is_exit, nvbit_api_cuda_t cbid,
                          const char *name, void *params, CUresult *pStatus) {
-  printf("- nvbit_at_cuda_event(%s, %d)\n", name, counter++); 
+  if (cbid == API_CUDA_cuLaunchKernel_ptsz || 
+      cbid == API_CUDA_cuLaunchKernel)
+  {
+    cuLaunchKernel_params *p = (cuLaunchKernel_params*)params;
+    printf("- nvbit_at_cuda_event(%s, %d, %d [%p])\n", name, 
+      counter++, skip_flag);
+  }
+  else if (strcmp(name, "cuLaunchKernelEx") == 0) {
+    cuLaunchKernelEx_params *p = (cuLaunchKernelEx_params*)params; 
+    printf("- nvbit_at_cuda_event(%s, %d, %d [%p])\n", name, 
+      counter++, skip_flag); 
+  }
+  else
+    printf("- nvbit_at_cuda_event(%s, %d, %d)\n", name, counter++, skip_flag); 
+  int local_counter = counter;  
+  
   if (skip_flag)
     return;
 
@@ -336,8 +376,32 @@ void nvbit_at_cuda_event(CUcontext ctx, int is_exit, nvbit_api_cuda_t cbid,
     }
 
   } else if (cbid == API_CUDA_cuLaunchKernel_ptsz ||
-             cbid == API_CUDA_cuLaunchKernel) {
-    cuLaunchKernel_params *p = (cuLaunchKernel_params *)params;
+             cbid == API_CUDA_cuLaunchKernel ||
+             strcmp(name, "cuLaunchKernelEx") == 0) {
+    cuLaunchKernel_params *p;
+    int dynamically_allocated_params; 
+    if (cbid == API_CUDA_cuLaunchKernel_ptsz || 
+        cbid == API_CUDA_cuLaunchKernel)
+    {
+      p = (cuLaunchKernel_params *)params;
+      dynamically_allocated_params = 0; 
+    }
+    else { // cuLaunchKernelEx
+      printf("  - cuLaunchKernelEx found! [%d]", local_counter);
+      cuLaunchKernelEx_params *exp = (cuLaunchKernelEx_params*)params; 
+      p = (cuLaunchKernel_params*)malloc(sizeof(cuLaunchKernel_params)); 
+      dynamically_allocated_params = 1; 
+
+      // Make "p" identical to "exp" 
+      p->gridDimX = exp->config->gridDimX; 
+      p->gridDimY = exp->config->gridDimY;
+      p->gridDimZ = exp->config->gridDimZ;
+      p->blockDimX = exp->config->blockDimX;
+      p->blockDimY = exp->config->blockDimY;
+      p->blockDimZ = exp->config->blockDimZ;
+      p->sharedMemBytes = exp->config->sharedMemBytes; 
+      p->hStream = exp->config->hStream; 
+    }
 
     if (!is_exit) {
 
@@ -381,9 +445,12 @@ void nvbit_at_cuda_event(CUcontext ctx, int is_exit, nvbit_api_cuda_t cbid,
       if (!stop_report) {
         std::string file_path = traces_location + "/" + buffer;
         
+        printf("[%d] Opening resultsFile (%s)\n", local_counter, 
+          file_path.c_str()); 
         resultsFile = fopen(file_path.c_str(), "a");
 
-        printf("Writing results to %s\n", buffer);
+        printf("[%d] Writing results to %s\n", local_counter, buffer);
+        strcpy(resultsFileName, buffer);
         
         /*fprintf(resultsFile, "-gpu id = %d\n", gpu_id);*/
         
@@ -408,9 +475,8 @@ void nvbit_at_cuda_event(CUcontext ctx, int is_exit, nvbit_api_cuda_t cbid,
         fprintf(resultsFile, "\n");
 
         fprintf(resultsFile,
-                "#traces format = threadblock_x threadblock_y threadblock_z "
-                "warpid_tb PC mask dest_num [reg_dests] opcode src_num "
-                "[reg_srcs] mem_width [adrrescompress?] [mem_addresses]\n");
+                "#traces format = [line_num] PC mask dest_num [reg_dests] opcode src_num "
+                "[reg_srcs] mem_width [adrrescompress?] [mem_addresses] immediate\n");
         fprintf(resultsFile, "\n");
       }
 
@@ -475,12 +541,18 @@ void nvbit_at_cuda_event(CUcontext ctx, int is_exit, nvbit_api_cuda_t cbid,
       fprintf(statsFile, "\n");
       fclose(statsFile);
 
-      if (!stop_report)
+      if (!stop_report) {
+        printf("Closing results file.\n"); 
         fclose(resultsFile);
+      } 
 
       if (active_from_start && dynamic_kernel_limit_end && kernelid > dynamic_kernel_limit_end)
         active_region = false;
     }
+
+    if (dynamically_allocated_params)
+      free(p); 
+
   } else if (cbid == API_CUDA_cuProfilerStart && is_exit) {
       if (!active_from_start) {
         active_region = true;
@@ -583,14 +655,11 @@ void base_delta_compress(const uint64_t *addrs, const std::bitset<32> &mask,
 void *recv_thread_fun(void *) {
   printf("- recv_thread_fun()\n");
   char *recv_buffer = (char *)malloc(CHANNEL_SIZE);
-
   while (recv_thread_started) {
     uint32_t num_recv_bytes = 0;
     if (recv_thread_receiving &&
         (num_recv_bytes = channel_host.recv(recv_buffer, CHANNEL_SIZE)) > 0) {
       uint32_t num_processed_bytes = 0;
-     
-      
       while (num_processed_bytes < num_recv_bytes) {
         inst_trace_t *ma = (inst_trace_t *)&recv_buffer[num_processed_bytes];
 
@@ -600,21 +669,8 @@ void *recv_thread_fun(void *) {
           recv_thread_receiving = false;
           break;
         }
-        /*fprintf(resultsFile, "GPU%d ", gpu_id);
 
-        if (strcmp(id_to_opcode_map[ma->opcode_id].c_str(), "cudaMemcpyPeer") == 0 ||
-            strcmp(id_to_opcode_map[ma->opcode_id].c_str(), "cudaMemcpyPeerAsync") == 0 ||
-            strcmp(id_to_opcode_map[ma->opcode_id].c_str(), "ncclAllReduce") == 0 ||
-            strcmp(id_to_opcode_map[ma->opcode_id].c_str(), "ncclBroadcast") == 0 ||
-            strcmp(id_to_opcode_map[ma->opcode_id].c_str(), "ncclReduce") == 0 ||
-            strcmp(id_to_opcode_map[ma->opcode_id].c_str(), "ncclAllGather") == 0 ||
-            strcmp(id_to_opcode_map[ma->opcode_id].c_str(), "ncclReduceScatter") == 0) {
-          fprintf(resultsFile, "1 ");
-        } else {
-          fprintf(resultsFile, "0 ");
-        }
-        */ 
-
+        printf("Writing line to resultsFile \"%s\"\n", resultsFileName); 
         fprintf(resultsFile, "%d ", ma->cta_id_x);
         fprintf(resultsFile, "%d ", ma->cta_id_y);
         fprintf(resultsFile, "%d ", ma->cta_id_z);
@@ -622,6 +678,9 @@ void *recv_thread_fun(void *) {
         if (print_core_id) {
           fprintf(resultsFile, "%d ", ma->sm_id);
           fprintf(resultsFile, "%d ", ma->warpid_sm);
+        }
+        if(lineinfo){
+          fprintf(resultsFile, "%d ", ma->line_num);
         }
         fprintf(resultsFile, "%04x ", ma->vpc); // Print the virtual PC
         fprintf(resultsFile, "%08x ", ma->active_mask & ma->predicate_mask);
@@ -693,7 +752,8 @@ void *recv_thread_fun(void *) {
           fprintf(resultsFile, "0 ");
         }
 
-        fprintf(resultsFile, "\n");
+        // Print the immediate
+        fprintf(resultsFile, "%d\n", ma->imm);
 
         num_processed_bytes += sizeof(inst_trace_t);
       }
